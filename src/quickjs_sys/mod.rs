@@ -2,6 +2,7 @@
 mod macros;
 pub mod js_class;
 pub mod js_module;
+pub mod js_promise;
 
 use std::collections::HashMap;
 
@@ -142,13 +143,28 @@ unsafe extern "C" fn module_loader(
     m.cast()
 }
 
-pub struct Runtime(*mut JSRuntime);
+struct InnerRuntime(*mut JSRuntime);
+impl Drop for InnerRuntime {
+    fn drop(&mut self) {
+        unsafe { JS_FreeRuntime(self.0) };
+    }
+}
+pub struct Runtime {
+    ctx: Context,
+    rt: InnerRuntime,
+}
 
 impl Runtime {
     pub fn new() -> Self {
         unsafe {
-            let mut rt = Runtime(JS_NewRuntime());
-            JS_SetModuleLoaderFunc(rt.0, None, Some(module_loader), std::ptr::null_mut());
+            let raw_rt = JS_NewRuntime();
+            let ctx = Context::new_with_rt(raw_rt);
+            JS_SetModuleLoaderFunc(raw_rt, None, Some(module_loader), std::ptr::null_mut());
+
+            let mut rt = Runtime {
+                ctx,
+                rt: InnerRuntime(raw_rt),
+            };
             rt.init_event_loop();
             rt
         }
@@ -158,12 +174,12 @@ impl Runtime {
         unsafe {
             let event_loop = Box::new(super::EventLoop::default());
             let event_loop_ptr: &'static mut super::EventLoop = Box::leak(event_loop);
-            JS_SetRuntimeOpaque(self.0, (event_loop_ptr as *mut super::EventLoop).cast());
+            JS_SetRuntimeOpaque(self.rt.0, (event_loop_ptr as *mut super::EventLoop).cast());
         }
     }
     fn drop_event_loop(&mut self) {
         unsafe {
-            let event_loop = JS_GetRuntimeOpaque(self.0) as *mut super::EventLoop;
+            let event_loop = JS_GetRuntimeOpaque(self.rt.0) as *mut super::EventLoop;
             if !event_loop.is_null() {
                 Box::from_raw(event_loop); // drop
             }
@@ -171,17 +187,61 @@ impl Runtime {
     }
 
     pub fn run_with_context<F: FnMut(&mut Context) -> R, R>(&mut self, mut f: F) -> R {
-        unsafe {
-            let mut ctx = Context::new_with_rt(self.0);
-            f(&mut ctx)
+        f(&mut self.ctx)
+    }
+
+    unsafe fn run_loop_without_io(&mut self) -> i32 {
+        log::trace!("Runtime run loop without io");
+        use crate::EventLoop;
+        use qjs::JS_ExecutePendingJob;
+
+        let rt = self.rt.0;
+        let event_loop = { (JS_GetRuntimeOpaque(rt) as *mut EventLoop).as_mut() }.unwrap();
+        let mut pctx: *mut JSContext = 0 as *mut JSContext;
+
+        loop {
+            'pending: loop {
+                log::trace!("Runtime JS_ExecutePendingJob");
+                let err = JS_ExecutePendingJob(rt, (&mut pctx) as *mut *mut JSContext);
+                if err <= 0 {
+                    if err < 0 {
+                        js_std_dump_error(pctx);
+                        return err;
+                    }
+                    break 'pending;
+                }
+            }
+
+            if event_loop.run_tick_task() == 0 {
+                break;
+            }
+            log::trace!("Runtime JS_ExecutePendingJob continue");
+        }
+        0
+    }
+
+    pub fn async_run_with_context(
+        &mut self,
+        box_fn: Box<dyn FnOnce(&mut Context) -> JsValue>,
+    ) -> RuntimeResult {
+        let box_fn = Some(box_fn);
+        RuntimeResult {
+            box_fn,
+            result: None,
+            rt: self,
         }
     }
+}
+
+pub struct RuntimeResult<'rt> {
+    box_fn: Option<Box<dyn FnOnce(&mut Context) -> JsValue>>,
+    result: Option<JsValue>,
+    rt: &'rt mut Runtime,
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.drop_event_loop();
-        unsafe { JS_FreeRuntime(self.0) };
     }
 }
 
@@ -239,6 +299,8 @@ pub struct Context {
     ctx: *mut JSContext,
 }
 
+unsafe impl Send for Context {}
+
 fn get_file_name(ctx: &mut Context, n_stack_levels: usize) -> JsValue {
     unsafe {
         let basename = JS_GetScriptOrModuleName(ctx.ctx, n_stack_levels as i32);
@@ -294,18 +356,6 @@ impl Context {
         unsafe { (JS_GetRuntimeOpaque(self.rt()) as *mut super::EventLoop).as_mut() }
     }
 
-    fn event_loop_run_once(&mut self) -> std::io::Result<usize> {
-        unsafe {
-            if let Some(event_loop) =
-                (JS_GetRuntimeOpaque(self.rt()) as *mut super::EventLoop).as_mut()
-            {
-                event_loop.run_once(self)
-            } else {
-                Ok(0)
-            }
-        }
-    }
-
     #[inline]
     unsafe fn rt(&mut self) -> *mut JSRuntime {
         JS_GetRuntime(self.ctx)
@@ -348,6 +398,16 @@ impl Context {
         super::internal_module::os::init_module(&mut ctx);
         super::internal_module::fs::init_module(&mut ctx);
 
+        #[cfg(feature = "nodejs_crypto")]
+        {
+            super::internal_module::crypto::init_module(&mut ctx);
+        }
+
+        #[cfg(feature = "ggml")]
+        {
+            super::internal_module::ggml::init_wasi_nn_ggml_module(&mut ctx);
+            super::internal_module::ggml::init_ggml_template_module(&mut ctx);
+        }
         ctx
     }
 
@@ -415,7 +475,6 @@ impl Context {
 
     pub fn eval_module_str(&mut self, code: String, filename: &str) {
         self.eval_buf(code.into_bytes(), filename, JS_EVAL_TYPE_MODULE);
-        self.promise_loop_poll();
     }
 
     pub fn new_function<F: JsFn>(&mut self, name: &str) -> JsFunction {
@@ -569,27 +628,9 @@ impl Context {
         }
     }
 
+    #[deprecated]
     pub fn js_loop(&mut self) -> std::io::Result<()> {
-        unsafe {
-            let rt = self.rt();
-
-            let mut pctx: *mut JSContext = 0 as *mut JSContext;
-            loop {
-                'pending: loop {
-                    let err = JS_ExecutePendingJob(rt, (&mut pctx) as *mut *mut JSContext);
-                    if err <= 0 {
-                        if err < 0 {
-                            js_std_dump_error(pctx);
-                            return Err(std::io::Error::from(std::io::ErrorKind::Other));
-                        }
-                        break 'pending;
-                    }
-                }
-                if self.event_loop_run_once()? == 0 {
-                    return Ok(());
-                }
-            }
-        }
+        todo!()
     }
 }
 
@@ -601,8 +642,16 @@ impl Drop for Context {
     }
 }
 
+impl Clone for Context {
+    fn clone(&self) -> Self {
+        Context {
+            ctx: unsafe { JS_DupContext(self.ctx) },
+        }
+    }
+}
+
 unsafe fn to_u32(ctx: *mut JSContext, v: JSValue) -> Result<u32, String> {
-    if JS_VALUE_GET_NORM_TAG_real(v) == JS_TAG_INT {
+    if JS_VALUE_GET_NORM_TAG_real(v) == JS_TAG_JS_TAG_INT {
         let mut r = 0u32;
         JS_ToUint32_real(ctx, &mut r as *mut u32, v);
         Ok(r)
@@ -659,19 +708,20 @@ impl Drop for JsRef {
         unsafe {
             let tag = JS_VALUE_GET_NORM_TAG_real(self.v);
             match tag {
-                JS_TAG_STRING
-                | JS_TAG_OBJECT
-                | JS_TAG_FUNCTION_BYTECODE
-                | JS_TAG_BIG_INT
-                | JS_TAG_BIG_FLOAT
-                | JS_TAG_BIG_DECIMAL
-                | JS_TAG_SYMBOL => JS_FreeValue_real(self.ctx, self.v),
+                JS_TAG_JS_TAG_STRING
+                | JS_TAG_JS_TAG_OBJECT
+                | JS_TAG_JS_TAG_FUNCTION_BYTECODE
+                | JS_TAG_JS_TAG_BIG_INT
+                | JS_TAG_JS_TAG_BIG_FLOAT
+                | JS_TAG_JS_TAG_BIG_DECIMAL
+                | JS_TAG_JS_TAG_SYMBOL => JS_FreeValue_real(self.ctx, self.v),
                 _ => {}
             }
         }
     }
 }
 
+unsafe impl Send for JsRef {}
 pub trait AsObject {
     fn js_ref(&self) -> &JsRef;
 
@@ -823,6 +873,12 @@ impl JsPromise {
     }
 }
 
+impl AsObject for JsPromise {
+    fn js_ref(&self) -> &JsRef {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsArray(JsRef);
 
@@ -840,7 +896,7 @@ impl JsArray {
             let mut values = Vec::new();
             for index in 0..(len as usize) {
                 let value_raw = JS_GetPropertyUint32(ctx, v, index as u32);
-                if JS_VALUE_GET_NORM_TAG_real(value_raw) == JS_TAG_EXCEPTION {
+                if JS_VALUE_GET_NORM_TAG_real(value_raw) == JS_TAG_JS_TAG_EXCEPTION {
                     return Err(JsException(JsRef { ctx, v: value_raw }));
                 }
                 let v = JsValue::from_qjs_value(ctx, value_raw);
@@ -1027,22 +1083,22 @@ impl JsValue {
         unsafe {
             let tag = JS_VALUE_GET_NORM_TAG_real(v);
             match tag {
-                JS_TAG_INT => {
+                JS_TAG_JS_TAG_INT => {
                     let mut num = 0;
                     JS_ToInt32(ctx, (&mut num) as *mut i32, v);
                     JsValue::Int(num)
                 }
-                JS_TAG_FLOAT64 => {
+                JS_TAG_JS_TAG_FLOAT64 => {
                     let mut num = 0_f64;
                     JS_ToFloat64(ctx, (&mut num) as *mut f64, v);
                     JsValue::Float(num)
                 }
-                JS_TAG_BIG_DECIMAL | JS_TAG_BIG_INT | JS_TAG_BIG_FLOAT => {
+                JS_TAG_JS_TAG_BIG_DECIMAL | JS_TAG_JS_TAG_BIG_INT | JS_TAG_JS_TAG_BIG_FLOAT => {
                     JsValue::BigNum(JsBigNum(JsRef { ctx, v }))
                 }
-                JS_TAG_STRING => JsValue::String(JsString(JsRef { ctx, v })),
-                JS_TAG_MODULE => JsValue::Module(JsModule(JsRef { ctx, v })),
-                JS_TAG_OBJECT => {
+                JS_TAG_JS_TAG_STRING => JsValue::String(JsString(JsRef { ctx, v })),
+                JS_TAG_JS_TAG_MODULE => JsValue::Module(JsModule(JsRef { ctx, v })),
+                JS_TAG_JS_TAG_OBJECT => {
                     if JS_IsFunction(ctx, v) != 0 {
                         JsValue::Function(JsFunction(JsRef { ctx, v }))
                     } else if JS_IsArrayBuffer(ctx, v) != 0 {
@@ -1055,14 +1111,14 @@ impl JsValue {
                         JsValue::Object(JsObject(JsRef { ctx, v }))
                     }
                 }
-                JS_TAG_BOOL => JsValue::Bool(JS_ToBool(ctx, v) != 0),
-                JS_TAG_NULL => JsValue::Null,
-                JS_TAG_EXCEPTION => JsValue::Exception(JsException(JsRef { ctx, v })),
-                JS_TAG_UNDEFINED => JsValue::UnDefined,
-                JS_TAG_FUNCTION_BYTECODE => {
+                JS_TAG_JS_TAG_BOOL => JsValue::Bool(JS_ToBool(ctx, v) != 0),
+                JS_TAG_JS_TAG_NULL => JsValue::Null,
+                JS_TAG_JS_TAG_EXCEPTION => JsValue::Exception(JsException(JsRef { ctx, v })),
+                JS_TAG_JS_TAG_UNDEFINED => JsValue::UnDefined,
+                JS_TAG_JS_TAG_FUNCTION_BYTECODE => {
                     JsValue::FunctionByteCode(JsFunctionByteCode(JsRef { ctx, v }))
                 }
-                JS_TAG_SYMBOL => JsValue::Symbol(JsRef { ctx, v }),
+                JS_TAG_JS_TAG_SYMBOL => JsValue::Symbol(JsRef { ctx, v }),
                 _ => JsValue::Other(JsRef { ctx, v }),
             }
         }

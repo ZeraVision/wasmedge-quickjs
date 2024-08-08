@@ -1,6 +1,10 @@
 pub mod core;
+#[cfg(feature = "nodejs_crypto")]
+pub mod crypto;
 pub mod encoding;
 pub mod fs;
+#[cfg(feature = "ggml")]
+pub mod ggml;
 pub mod httpx;
 #[cfg(feature = "img")]
 pub mod img_module;

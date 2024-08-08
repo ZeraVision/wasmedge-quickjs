@@ -66,25 +66,50 @@ fn args_parse() -> (String, Vec<String>) {
     (code, res_args)
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     use wasmedge_quickjs as q;
+    env_logger::init();
+
     let mut rt = q::Runtime::new();
-    rt.run_with_context(|ctx| {
 
-        // add host functions into context
-        let f = ctx.new_function::<host_extern::TransferFn>("transfer");
-        ctx.get_global().set("transfer", f.into());
-        //
-        let f = ctx.new_function::<host_extern::BalanceFn>("balance");
-        ctx.get_global().set("balance", f.into());
-        //
-
-        let (code, mut rest_arg) = args_parse();
-        
-        rest_arg.insert(0, code.clone());
-        ctx.put_args(rest_arg);
-        ctx.eval_module_str(code, "");
-
-        ctx.js_loop().unwrap();
-    });
+    let r = rt
+        .async_run_with_context(Box::new(|ctx| {
+            let (file_path, mut rest_arg) = args_parse();
+            let code = std::fs::read_to_string(&file_path);
+            match code {
+                Ok(code) => {
+                    rest_arg.insert(0, file_path.clone());
+                    ctx.put_args(rest_arg);
+                    ctx.eval_buf(code.into_bytes(), &file_path, 1)
+                }
+                Err(e) => {
+                    eprintln!("{}", e.to_string());
+                    JsValue::UnDefined
+                }
+            }
+        }))
+        .await;
+    log::info!("{r:?}");
 }
+
+
+    // rt.run_with_context(|ctx| {
+
+    //     // add host functions into context
+    //     let f = ctx.new_function::<host_extern::TransferFn>("transfer");
+    //     ctx.get_global().set("transfer", f.into());
+    //     //
+    //     let f = ctx.new_function::<host_extern::BalanceFn>("balance");
+    //     ctx.get_global().set("balance", f.into());
+    //     //
+
+    //     let (code, mut rest_arg) = args_parse();
+        
+    //     rest_arg.insert(0, code.clone());
+    //     ctx.put_args(rest_arg);
+    //     ctx.eval_module_str(code, "");
+
+    //     ctx.js_loop().unwrap();
+    // });
+
