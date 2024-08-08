@@ -46,7 +46,7 @@ mod host_extern {
             if let Some(JsValue::Int(to)) = argv.get(1) {
               if let Some(JsValue::Float(amount)) = argv.get(2) {
                 unsafe {
-                    let r = transfer(*from, *to, *amount);
+                    let r = transfer(*from, *to, (*amount) as f32);
                     r.into()
                 }
               } else {
@@ -87,8 +87,7 @@ async fn main() {
 
     let r = rt
         .async_run_with_context(Box::new(|ctx| {
-
-            // add host functions into context
+            add host functions into context
             let f = ctx.new_function::<host_extern::TransferFn>("transfer");
             ctx.get_global().set("transfer", f.into());
             //
@@ -96,31 +95,11 @@ async fn main() {
             ctx.get_global().set("balance", f.into());
 
             let (code, mut rest_arg) = args_parse();
-              rest_arg.insert(0, code.clone());
-                    ctx.put_args(rest_arg);
-                    ctx.eval_module_str(code, "");
+            rest_arg.insert(0, code.clone());
+            ctx.put_args(rest_arg);
+            ctx.eval_module_str(code, "")
         }))
         .await;
     log::info!("{r:?}");
 }
-
-
-    // rt.run_with_context(|ctx| {
-
-    //     // add host functions into context
-    //     let f = ctx.new_function::<host_extern::TransferFn>("transfer");
-    //     ctx.get_global().set("transfer", f.into());
-    //     //
-    //     let f = ctx.new_function::<host_extern::BalanceFn>("balance");
-    //     ctx.get_global().set("balance", f.into());
-    //     //
-
-    //     let (code, mut rest_arg) = args_parse();
-        
-    //     rest_arg.insert(0, code.clone());
-    //     ctx.put_args(rest_arg);
-    //     ctx.eval_module_str(code, "");
-
-    //     ctx.js_loop().unwrap();
-    // });
 
