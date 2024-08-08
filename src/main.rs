@@ -29,37 +29,37 @@ mod host_extern {
       pub fn emit(value_pointer: *const u8, value_length: i32);
   }
 
-  pub struct BalanceFn;
-  impl JsFn for BalanceFn {
-      fn call(ctx: &mut Context, _this_val: JsValue, argv: &[JsValue]) -> JsValue {
-        unsafe {
-          let r = balance();
-          r.into()
-        }
-      }
-  }
+  // pub struct BalanceFn;
+  // impl JsFn for BalanceFn {
+  //     fn call(ctx: &mut Context, _this_val: JsValue, argv: &[JsValue]) -> JsValue {
+  //       unsafe {
+  //         let r = balance();
+  //         r.into()
+  //       }
+  //     }
+  // }
 
-  pub struct TransferFn;
-  impl JsFn for TransferFn {
-      fn call(ctx: &mut Context, _this_val: JsValue, argv: &[JsValue]) -> JsValue {
-          if let Some(JsValue::Int(from)) = argv.get(0) {
-            if let Some(JsValue::Int(to)) = argv.get(1) {
-              if let Some(JsValue::Float(amount)) = argv.get(2) {
-                unsafe {
-                    let r = transfer(*from, *to, (*amount) as f32);
-                    r.into()
-                }
-              } else {
-                  ctx.throw_type_error("'amount' is not a float").into()
-              }
-            } else {
-                ctx.throw_type_error("'to' is not a int").into()
-            }
-          } else {
-              ctx.throw_type_error("'from' is not a int").into()
-          }
-      }
-  }
+//   pub struct TransferFn;
+//   impl JsFn for TransferFn {
+//       fn call(ctx: &mut Context, _this_val: JsValue, argv: &[JsValue]) -> JsValue {
+//           if let Some(JsValue::Int(from)) = argv.get(0) {
+//             if let Some(JsValue::Int(to)) = argv.get(1) {
+//               if let Some(JsValue::Float(amount)) = argv.get(2) {
+//                 unsafe {
+//                     let r = transfer(*from, *to, (*amount) as f32);
+//                     r.into()
+//                 }
+//               } else {
+//                   ctx.throw_type_error("'amount' is not a float").into()
+//               }
+//             } else {
+//                 ctx.throw_type_error("'to' is not a int").into()
+//             }
+//           } else {
+//               ctx.throw_type_error("'from' is not a int").into()
+//           }
+//       }
+//   }
 }
 
 fn args_parse() -> (String, Vec<String>) {
@@ -87,17 +87,17 @@ async fn main() {
 
     let r = rt
         .async_run_with_context(Box::new(|ctx| {
-            add host functions into context
-            let f = ctx.new_function::<host_extern::TransferFn>("transfer");
-            ctx.get_global().set("transfer", f.into());
-            //
-            let f = ctx.new_function::<host_extern::BalanceFn>("balance");
-            ctx.get_global().set("balance", f.into());
+            // add host functions into context
+            // let f = ctx.new_function::<host_extern::TransferFn>("transfer");
+            // ctx.get_global().set("transfer", f.into());
+            // //
+            // let f = ctx.new_function::<host_extern::BalanceFn>("balance");
+            // ctx.get_global().set("balance", f.into());
 
             let (code, mut rest_arg) = args_parse();
             rest_arg.insert(0, code.clone());
             ctx.put_args(rest_arg);
-            ctx.eval_module_str(code, "")
+            ctx.eval_module_str(code, "").into()
         }))
         .await;
     log::info!("{r:?}");
