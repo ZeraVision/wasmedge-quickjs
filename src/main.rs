@@ -96,21 +96,9 @@ async fn main() {
             ctx.get_global().set("balance", f.into());
 
             let (code, mut rest_arg) = args_parse();
-            // let code = std::fs::read_to_string(&file_path);
-            match code {
-                Ok(code) => {
-                    rest_arg.insert(0, code.clone());
+              rest_arg.insert(0, code.clone());
                     ctx.put_args(rest_arg);
                     ctx.eval_module_str(code, "");
-                    // rest_arg.insert(0, file_path.clone());
-                    // ctx.put_args(rest_arg);
-                    // ctx.eval_buf(code.into_bytes(), &file_path, 1)
-                }
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                    JsValue::UnDefined
-                }
-            }
         }))
         .await;
     log::info!("{r:?}");
